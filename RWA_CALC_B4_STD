@@ -1,0 +1,141 @@
+
+
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Jul 23 13:31:58 2018
+
+@author: e629911
+"""
+
+import pandas as pd
+import numpy as np
+#from numpy import nan as NA
+import math
+import pyodbc
+import os
+
+#internals = pd.Series([18340, 544, 570, 10489, 2827]).astype(object)
+current_date = input("Please enter date of calculation as month_day_year, e.g. 3/31/2018: ")
+current_directory = (os.path.join(os.path.dirname(__file__)))
+parent_directory = os.path.split(current_directory)[0]
+input_path = os.path.join(parent_directory, 'Input Files',current_date.replace("/","_"),'RW - STD')
+input_path = input_path.replace('\\','/')
+reference_path = os.path.join(parent_directory, 'Reference Tables','RW - STD')
+reference_path = reference_path.replace('\\','/')
+
+output_path = os.path.join(parent_directory, 'Output Files',current_date.replace("/","_"),'RW - STD')
+output_path = output_path.replace('\\','/')
+
+#    output_path_der = os.path.join(parent_directory, 'Output Files',current_date.replace("/","_"),'EAD - Derivatives')
+#    output_path_der = output_path_der.replace('\\','/')
+#    
+#    output_path_repo = os.path.join(parent_directory, 'Output Files',current_date.replace("/","_"),'EAD - Repo-Style')
+#    output_path_repo = output_path_repo.replace('\\','/')
+
+def rw(ead):
+    cp_type_map = pd.read_excel(reference_path + "/CP_ID_Map.xlsx")
+    BIV_map = pd.read_excel(reference_path + "/BIV_CP_Map.xlsx")
+    BIV_rws = pd.read_excel(reference_path + "/BIV_RW_Table.xlsx")
+    
+    #cp_type_map['CP_TYPE_ID'] = cp_type_map['CP_TYPE_ID'].astype(str)
+    #cp_type_map['CP_SUB_TYPE_ID'] = cp_type_map['CP_SUB_TYPE_ID'].astype(str)
+    #ead['COUNTERPARTY_TYPE_ID'] = ead['COUNTERPARTY_TYPE_ID'].astype(str)
+    #ead['COUNTERPARTY_SUB_TYPE_ID'] = ead['COUNTERPARTY_SUB_TYPE_ID'].astype(str)
+
+    ead = ead.merge(cp_type_map[['CP_TYPE_ID', 'CP_TYPE_DESC']].drop_duplicates(subset=['CP_TYPE_ID']), how = 'left', left_on = 'COUNTERPARTY_TYPE_ID', right_on = 'CP_TYPE_ID')
+    #ead = pd.merge(ead.assign(x=ead['COUNTERPARTY_SUB_TYPE_ID'].astype(str)),cp_type_map.assign(y=cp_type_map['CP_SUB_TYPE_ID'].astype(str)), how='left', left_on='x', right_on= 'y')
+    ead = ead.merge(cp_type_map[['CP_SUB_TYPE_ID', 'CP_SUBTYPE_DESC']].drop_duplicates(subset=['CP_SUB_TYPE_ID']), how = 'left', left_on = 'COUNTERPARTY_SUB_TYPE_ID', right_on = 'CP_SUB_TYPE_ID')
+
+    ead.loc[lambda z: (ead['CP_SUBTYPE_DESC'].astype(str) == 'nan'), 'CP_SUBTYPE_DESC'] = ead['CP_TYPE_DESC']
+    ead = ead.merge(BIV_map, how = 'left', left_on = 'CP_SUBTYPE_DESC', right_on = 'CP_SUBTYPE_DESC')
+    #add a catch for the nans, need to list them out for checking
+    ead.loc[lambda z: (ead['BIV_CLASS'].astype(str) == 'nan'), 'BIV_CLASS'] = 'Nonelig Corp'
+
+    ead.loc[lambda z: (ead['BIV_CLASS'] == 'Corporates') | (ead['BIV_CLASS'] == 'Banks') & (ead['Rating'] < 10), 'Rating_tier'] = 'B'
+    ead.loc[lambda z: (ead['BIV_CLASS'] == 'Corporates') | (ead['BIV_CLASS'] == 'Banks') & (ead['Rating'] < 7), 'Rating_tier'] = 'A'
+    ead.loc[lambda z: (ead['BIV_CLASS'] == 'Corporates') | (ead['BIV_CLASS'] == 'Banks') & (ead['Rating'] >= 10), 'Rating_tier'] = 'C'
+    ead.loc[lambda z: (ead['BIV_CLASS'] == 'Nonelig Corp'), 'Rating_tier'] = 'C'
+
+    ead.loc[lambda z: (ead['BIV_CLASS'] == 'Banks') & (ead['WAMAT'] < 91), 'BIV_CLASS'] = 'Banksshort'
+    ead.loc[lambda z: (ead['BIV_CLASS'] == 'Banks') & (ead['WAMAT'] >= 91), 'BIV_CLASS'] = 'Bankslong'
+
+    ead = pd.merge(ead, BIV_rws, how = 'left', on = ['BIV_CLASS', 'Rating_tier'])
+
+    ead.loc[lambda z: (ead['BIV_CLASS'] != 'Corporates') & (ead['BIV_CLASS'] != 'Banksshort') & (ead['BIV_CLASS'] != 'Bankslong') & (ead['BIV_CLASS'] != 'Nonelig Corp'), 'BIV_RW'] = ead['BIII_RW']
+    #ead.loc[lambda z: (ead['CP_TYPE_DESC'] == 'SECURITIZATION'), 'BIV_RW'] = ead['BIII_RW']
+    return ead
+
+def saccr_prep(ead):
+    cp_types = pd.read_excel(input_path + "/CP_Type_Sub_IDs_Input.xlsx")
+    ead = ead.merge(cp_types.drop_duplicates(subset=['COUNTERPARTY_ID']), left_on='COUNTERPARTY_ID',right_on = 'COUNTERPARTY_ID',how = 'left')
+    ead = rw(ead)
+    return ead
+
+saccr_rw_net = saccr_prep(pd.read_csv(input_path + "/margined_netted_ead.txt", sep="|", encoding = 'utf-8'))
+
+saccr_rw_net['BIV_RWA'] = saccr_rw_net['BIV_RW'] * saccr_rw_net['SA_CCR_EAD_MULTI']
+saccr_rw_net['BIII_RWA'] = saccr_rw_net['BIII_RW'] * saccr_rw_net['CEM_EAD']
+
+saccr_rw_unnet = saccr_prep(pd.read_csv(input_path + "/unnetted_ead.txt", sep="|", encoding = 'utf-8'))
+saccr_rw_unnet['BIV_RWA'] = saccr_rw_unnet['BIV_RW'] * saccr_rw_unnet['SA_CCR_EAD']
+saccr_rw_unnet['BIII_RWA'] = saccr_rw_unnet['BIII_RW'] * saccr_rw_unnet['CEM_EAD']
+
+def book_std():
+    cols = ['SECURITY_POSITIONS_REF',	'CONTRACT_REFERENCE', 'DEALBOOK', 'ASSET_CLASS_NEW', 'NETTING_AGREEMENT_REFERENCE', 'CONTRACT_TYPE', 'COUNTERPARTY_TYPE_ID','COUNTERPARTY_SUB_TYPE_ID', 'COUNTERPARTY_NEW', 'COUNTERPARTY_NEW_DESC', 'EAD', 'EAD_ORIGINAL', 'K_MATURITY', 'RW_NEW', 'RWA', 'RESIDUAL_MATURITY', 'ORIGINAL_MATURITY', 'INTERCO', 'Product']
+    
+    ead = pd.read_excel(input_path + "/Book_STD_Input.xlsx", sep = "|", usecols = cols)
+    cond = (ead['Product'] != 'FX') & (ead['Product'] != 'FX Net') & (ead['Product'] != 'CCY SWAP') & (ead['Product'] != 'IRC Net') & (ead['Product'] != 'REPOS: Non-FICC') & (ead['Product'] != 'Loans - Undrawn') & (ead['Product'] != 'Leveraged Loans - Undrawn') & (ead['Product'] != 'Muni Loans - Undrawn') & (ead['Product'] != 'Loans - Drawn') & (ead['Product'] != 'CRE Loans - Drawn') & (ead['Product'] != 'REPOS: FICC') & (ead['Product'] != 'Muni Loans - Drawn') & (ead['Product'] != 'Leveraged Loans - Drawn') & (ead['Product'] != 'CRE Loans - Undrawn')
+    ead = ead[cond]
+    #ead['COUNTERPARTY_TYPE_NEW'] = ead['COUNTERPARTY_TYPE_NEW'].astype(str)
+    #ead['COUNTERPARTY_TYPE_ID'], ead['COUNTERPARTY_SUB_TYPE_ID'] = ead['COUNTERPARTY_TYPE_NEW'].str.split('-',1).str
+    #ead['COUNTERPARTY_TYPE_ID'].convert_objects(convert_numeric = True)
+    #ead['COUNTERPARTY_SUB_TYPE_ID'].convert_objects(convert_numeric = True)
+    
+    ead['WAMAT'] = ead['ORIGINAL_MATURITY'] * 365
+    book_ratings = pd.read_excel(input_path + "/ADV-SSC_Ratings.xlsx")
+    ead['COUNTERPARTY_NEW'] = ead['COUNTERPARTY_NEW'].astype(str)
+    book_ratings['COUNTERPARTY_NEW'] = book_ratings['COUNTERPARTY_NEW'].astype(str)
+    ead = ead.merge(book_ratings[['COUNTERPARTY_NEW','ADV_SSC_RATING']].drop_duplicates(subset=['COUNTERPARTY_NEW']), how = 'left', left_on = 'COUNTERPARTY_NEW', right_on = 'COUNTERPARTY_NEW')
+    
+    ead.rename(columns = {'COUNTERPARTY_NEW':'COUNTERPARTY_ID', 'ADV_SSC_RATING': 'Rating', 'RW_NEW': 'BIII_RW'}, inplace = True)
+    #ead.loc[lambda z: (ead['COUNTERPARTY_SUB_TYPE_ID'] == 'NA'), 'COUNTERPARTY_SUB_TYPE_ID'] = np.nan
+    
+    #cp_type_map = pd.read_excel("CP_ID_Map.xlsx")
+    #cp_type_map['CP_TYPE_ID'] = cp_type_map['CP_TYPE_ID'].astype(str)
+    #cp_type_map['CP_SUB_TYPE_ID'] = cp_type_map['CP_SUB_TYPE_ID'].astype(str)
+    #ead['COUNTERPARTY_TYPE_ID'] = ead['COUNTERPARTY_TYPE_ID'].astype(str)
+    #ead['COUNTERPARTY_SUB_TYPE_ID'] = ead['COUNTERPARTY_SUB_TYPE_ID'].astype(str)
+    #ead = ead.merge(cp_type_map[['CP_TYPE_ID', 'CP_TYPE_DESC']].drop_duplicates(subset=['CP_TYPE_ID']), how = 'left', left_on = 'COUNTERPARTY_TYPE_ID', right_on = 'CP_TYPE_ID')
+    #ead = ead.merge(cp_type_map[['CP_SUB_TYPE_ID', 'CP_SUBTYPE_DESC']], how = 'left', left_on = 'COUNTERPARTY_SUB_TYPE_ID', right_on = 'CP_SUB_TYPE_ID')
+    
+    ead.to_csv(output_path + "/book_test.txt", sep = "|", index=True)
+    ead = rw(ead)
+    return ead
+
+book_rw = book_std()
+book_rw['BIV_RWA'] = book_rw['BIV_RW'] * book_rw['EAD']
+book_rw['BIII_RWA'] = book_rw['BIII_RW'] * book_rw['EAD']
+book_rw.loc[lambda z: (book_rw['Product'] == 'Default Fund Contribution') | (book_rw['Product'] == 'Derivatives Clearing') | (book_rw['Product'] == 'Equity IP') | (book_rw['Product'] == 'Financial Market Utility Deposit'), 'BIV_RWA'] = book_rw['BIII_RWA']
+
+
+book_rw.to_csv(output_path + "/book_rw.txt", sep = "|", index = True)
+saccr_rw_net.to_csv(output_path + "/saccr_rw_net.txt", sep = "|", index = True)
+saccr_rw_unnet.to_csv(output_path + "/saccr_rw_unnet.txt", sep = "|", index = True)
+
+def sft_prep(ead):
+    cp_map = pd.read_excel(input_path + "/SFT_CP_Map.xlsx", sep="/") #this input should include both EC and Agency, take all Agency data and place in table and then add EC data below Agency
+    ead = ead.merge(cp_map.drop_duplicates(subset=['NETTING_NODE_ID']),on = 'NETTING_NODE_ID', how='left')
+    ead.to_csv(output_path + "/ead_test.txt", sep = "|", index = True)
+    ead.rename(columns = {'RATING':'Rating'}, inplace = True)
+    ead = rw(ead)
+    return ead
+
+agency_rw = sft_prep(pd.read_csv(input_path + "/agency_ead.txt", sep="|"))
+ec_rw = sft_prep(pd.read_csv(input_path + "/ec_ead.txt", sep="|"))
+agency_rw['BIV_RWA'] = agency_rw['BIV_RW'] * agency_rw['EAD']
+ec_rw['BIV_RWA'] = ec_rw['BIV_RW'] * ec_rw['EAD']
+
+agency_rw.to_csv(output_path + "/agency_rw.txt", sep = "|", index = True)
+ec_rw.to_csv(output_path + "/ec_rw.txt", sep = "|", index = True)
+
+#ead = pd.concat([(chunk[chunk['Product'] != 'FX']) | (chunk[chunk['Product'] != 'FX Net']) | (chunk[chunk['Product'] != 'IRC Net']) | (chunk[chunk['Product'] != 'Loans - Drawn']) | (chunk[chunk['Product'] != 'Loans - Undrawn']) | (chunk[chunk['Product'] != 'Leveraged Loans - Undrawn']) for chunk in x])
