@@ -1,0 +1,204 @@
+
+# -*- coding: utf-8 -*-
+"""
+Created on Wed May 30 14:55:44 2018
+
+@author: e629911
+"""
+
+import pandas as pd
+import numpy as np
+from numpy import nan as NA
+import math
+import os
+
+#internals = pd.Series([18340, 544, 570, 101672, 10489, 2827])
+internals = pd.Series([544, 570, 101672, 10489, 2827]) #temporary change made by Rich on 12/14
+current_date = input("Please enter date of calculation as month_day_year, e.g. 3/31/2018: ")
+ec_ag = input("Please enter Agency, EC, or EC w/floors for product calculation. If this is for Agency, please list the number of the run if multiple input files are being run, i.e. Agency_1, Agency_2, etc.: ")
+#current_date = '9/30/2018'
+#ec_ag = 'EC'
+
+#Setting up the variables to query the correct directories for the inputs, parameters, and outputs
+current_directory = (os.path.join(os.path.dirname(__file__)))
+parent_directory = os.path.split(current_directory)[0]
+input_path = os.path.join(parent_directory, 'Input Files',current_date.replace("/","_"),'EAD - Repo-Style',ec_ag)
+input_path = input_path.replace('\\','/')
+reference_path = os.path.join(parent_directory, 'Reference Tables','EAD - Repo-Style')
+reference_path = reference_path.replace('\\','/')
+output_path = os.path.join(parent_directory, 'Output Files',current_date.replace("/","_"),'EAD - Repo-Style',ec_ag)
+output_path = output_path.replace('\\','/')
+
+if ec_ag[0] == "A": ec_ag = "Agency"
+
+#Reading in the data and correcting for gaps in data in the currency field
+data_set = pd.read_excel(input_path + "/SecFin_Input.xlsx")
+data_set['RAY_HFX'] = data_set['CERES_CURRENCY_CD']
+data_set.loc[lambda x: (data_set['CERES_CURRENCY_CD'].astype(str) == 'nan') | (data_set['CERES_CURRENCY_CD'] == 0),'RAY_HFX'] = data_set['CURRENCY']
+data_set['SEC_ID'] = data_set['SEC_ID'].astype(str)
+
+#code change to account for internal/external added on 11/30
+data_set['INT_EXT'] = data_set['COUNTERPARTY_ID'].isin(internals)
+data_set['INT_EXT'] = data_set['INT_EXT'].replace([True,False],['Internal','External'])
+data_set = data_set[data_set['INT_EXT'] != 'Internal']
+
+#Reading in the haircuts and assigning haircuts and floors to individual positions
+def haircut_table(x):
+    crc_table = pd.read_excel(reference_path + "/CRC_Parameter.xlsx")
+    haircuts = pd.read_excel(reference_path + "/SFT_Haircut_Table.xlsx")
+    x['COUNTRY_MERGE'] = x['B3_DERIVED_COUNTRY']
+    x.loc[lambda z: x['COUNTRY_MERGE'].astype(str) == 'nan','COUNTRY_MERGE'] = x['ISO_CNTRY_CD']
+    
+    x = x.merge(crc_table,left_on='COUNTRY_MERGE',right_on='ISO_CODE', how = 'left')
+    x.loc[lambda z: x['B3_FRB_STD_CLASS'].str[:3] == 'Sov','CRC_ISSUER_RW'] = x['BIII Std Sovereign RW'] 
+    x.loc[lambda z: x['B3_FRB_STD_CLASS'].str[:3] == 'GSE','CRC_ISSUER_RW'] = x['BIII Std App GO PSE RW']
+    x.loc[lambda z: x['B3_FRB_STD_CLASS'].str[:4] == 'Bank','CRC_ISSUER_RW'] = x['BIII Std Bank RW']
+         
+    mat_bands = pd.read_excel(reference_path + "/Maturity_Bands.xlsx")
+    x = x.merge(mat_bands[['B3_FRB_STD_CLASS','Maturity Band ID']],on='B3_FRB_STD_CLASS',how = 'left')
+    x = x.merge(haircuts[['B3_FRB_STD_CLASS','CRC_ISSUER_RW','Holding Period','Haircut Level','Haircut Floor']],on=['B3_FRB_STD_CLASS','CRC_ISSUER_RW'],how = 'left')
+    x.loc[lambda z: (x['B3_ASSET_SUBCLASS'] == 'Convertibles') | (x['NETTING_NODE_ID'].str[-2:] == 'LL') | (x['B3_ASSET_SUBCLASS'].str[:3] == 'Sec'),'Holding Period'] = 20
+    return x
+
+data_set = haircut_table(data_set)
+    
+def transact_processing(x,y):    
+    if y != 'Agency':
+        x['EXPOSURE'] = 0
+        x.loc[lambda z: (x['POS_TYPE'] == 1) | (x['POS_TYPE'] == 2) | (x['POS_TYPE'] == 10),'EXPOSURE'] = x['MARKET_VALUE_USD_EQVL']
+        x.loc[lambda z: (x['POS_TYPE'] == 5) | (x['POS_TYPE'] == 9),'EXPOSURE'] = x['CONTRACT_AMT_USD_EQVL']
+        
+        x['COLLATERAL'] = 0
+        x.loc[lambda z: (x['POS_TYPE'] == 4) | (x['POS_TYPE'] == 6) | (x['POS_TYPE'] == 7) | (x['POS_TYPE'] == 8),'COLLATERAL'] = x['MARKET_VALUE_USD_EQVL']
+        x.loc[lambda z: (x['POS_TYPE'] == 3),'COLLATERAL'] = x['CONTRACT_AMT_USD_EQVL']
+                
+    else:
+        x['EXPOSURE'] = x['CONTRACT_AMT_USD_EQVL']
+        x.loc[lambda z: (x['POS_TYPE'] == 1) | (x['POS_TYPE'] == 2),'EXPOSURE'] = x['MARKET_VALUE_USD_EQVL']
+        x.loc[lambda z: (x['POS_TYPE'] == 4) | (x['POS_TYPE'] == 3) | (x['POS_TYPE'] == 6),'EXPOSURE'] = 0
+    
+        x['COLLATERAL'] = x['CONTRACT_AMT_USD_EQVL']
+        x.loc[lambda z: (x['POS_TYPE'] == 4) | (x['POS_TYPE'] == 6),'COLLATERAL'] = x['MARKET_VALUE_USD_EQVL']
+        x.loc[lambda z: (x['POS_TYPE'] == 1) | (x['POS_TYPE'] == 2) | (x['POS_TYPE'] == 5),'COLLATERAL'] = 0
+    
+    x.loc[lambda z: (x['B3_FRB_STD_CLASS'] == 'Ineligible Collateral'),'Holding Period'] = 10
+     
+    x['FOREX_POS'] = x['CONTRACT_AMT_USD_EQVL']
+    if y != 'Agency':
+        x.loc[lambda z: (x['POS_TYPE'] == 3),'FOREX_POS'] = -x['CONTRACT_AMT_USD_EQVL']
+        x.loc[lambda z: (x['POS_TYPE'] == 4) | (x['POS_TYPE'] == 6) | (x['POS_TYPE'] == 7) | (x['POS_TYPE'] == 8),'FOREX_POS'] = -x['MARKET_VALUE_USD_EQVL']
+        x.loc[lambda z: (x['POS_TYPE'] == 1) | (x['POS_TYPE'] == 2) | (x['POS_TYPE'] == 10),'FOREX_POS'] = x['MARKET_VALUE_USD_EQVL']
+        x.loc[lambda z: (x['POS_TYPE'] == 9) | (x['RAY_HFX'] == 'USD'),'FOREX_POS'] = 0
+    else:
+        x.loc[lambda z: (x['POS_TYPE'] == 3),'FOREX_POS'] = -x['CONTRACT_AMT_USD_EQVL']
+        x.loc[lambda z: (x['POS_TYPE'] == 4) | (x['POS_TYPE'] == 6),'FOREX_POS'] = -x['MARKET_VALUE_USD_EQVL']
+        x.loc[lambda z: (x['POS_TYPE'] == 1) | (x['POS_TYPE'] == 2),'FOREX_POS'] = x['MARKET_VALUE_USD_EQVL']
+        x.loc[lambda z: (x['RAY_HFX'] == x['Close-Out CCY(Agreement CCY)']),'FOREX_POS'] = 0
+        x.loc[lambda z: (x['RAY_HFX'] == 'USD') & (x['Close-Out CCY(Agreement CCY)'] == 'nan'),'FOREX_POS'] = 0
+    
+    x['FX_MAT_POS'] = x['FOREX_POS']*0.08*np.sqrt(x['Holding Period']/10)
+    x['MAT_EXP'] = x['TERM_DATE'] - x['AS_ON_DATE']
+    x['MAT_EXP'] = x['MAT_EXP'].dt.days    
+    x['MAT_EXP'] = x['MAT_EXP'] * x['EXPOSURE']
+    x['ESFS'] = (1 + x['Haircut Floor']) * x['EXPOSURE']
+    x['CTFT'] = (1 + x['Haircut Floor']) * x['COLLATERAL']
+    #x['HS_SIGN'] = 0
+    #x.loc[lambda z: (x['POS_TYPE'] == 1) | (x['POS_TYPE'] == 2),'HS_SIGN'] = 1
+    #x.loc[lambda z: (x['POS_TYPE'] == 4) | (x['POS_TYPE'] == 6),'HS_SIGN'] = -1
+     #HS_SIGN previously included here but removed and placed later in calculation
+    return x
+
+data_set = transact_processing(data_set,ec_ag)
+
+if ec_ag == 'EC w/floors':
+    def flr_calc(x):
+        fi_list = pd.read_excel(reference_path + "/Reg_FI_List.xlsx")
+        flrs = x.groupby(['NODE_ID','UCI'],as_index = False)[['EXPOSURE','COLLATERAL','ESFS','CTFT']].sum()
+        flrs['F_PORTFOLIO'] = (flrs['EXPOSURE']/flrs['ESFS'])/(flrs['COLLATERAL']/flrs['CTFT']) -1
+        flrs['F_THRESHOLD'] = (flrs['COLLATERAL']-flrs['EXPOSURE'])/flrs['EXPOSURE']
+        flrs = pd.merge(flrs, fi_list, on = 'UCI', how = 'left')
+        #x.loc[lambda z: (x['FI/Non-FI'] == 'FI-Regulated'), 'REG_CHECK'] = 'Yes'4
+        flrs['STATUS'] = 'Fail'
+        flrs.loc[lambda z: (flrs['F_THRESHOLD'] >= flrs['F_PORTFOLIO']), 'STATUS'] = 'Pass'
+        flrs.loc[lambda z: (flrs['COLLATERAL'] == 0) & (flrs['EXPOSURE'] > 0), 'STATUS'] = 'Fail'
+        flrs.loc[lambda z: (flrs['FI/Non-FI'] == 'FI-Regulated') | ((flrs['EXPOSURE'] == 0) & (flrs['COLLATERAL'] > 0)), 'STATUS'] = 'Pass'
+                        
+        flrs.to_csv(output_path + "/test_flrs.txt", sep = "|", index=True)
+        x = x.merge(flrs[['NODE_ID','STATUS']], on = 'NODE_ID', how = 'left')
+        x.loc[lambda z: (x['STATUS'] == 'Fail') & ((x['POS_TYPE'] == 3) | (x['POS_TYPE'] == 4) | (x['POS_TYPE'] == 6) | (x['POS_TYPE'] == 7) | (x['POS_TYPE'] == 8)), 'Haircut Level'] = 1
+        x['EsHs'] = x['MARKET_VALUE_USD_EQVL']*x['Haircut Level']*np.sqrt(x['Holding Period']/10)
+        x.loc[lambda z: (x['POS_TYPE'] == 3) | (x['POS_TYPE'] == 9),'EsHs'] = 0
+        x['HS'] = x['Haircut Level'] * np.sqrt(x['Holding Period']/10)
+        x.loc[lambda z: (x['Haircut Level'] == 1), 'HS'] = 1
+        x['HS_REVISED'] = x['Haircut Level'] * np.sqrt(x['Holding Period']/10)
+        x.loc[lambda z: (x['Haircut Level'] == 1), 'HS_REVISED'] = 1
+        x.to_csv(output_path + "/test_hcflr.txt", sep = "|", index=True)
+        return x
+    data_set = flr_calc(data_set)
+else:
+    data_set['EsHs'] = data_set['MARKET_VALUE_USD_EQVL']*data_set['Haircut Level']*np.sqrt(data_set['Holding Period']/10)
+            #x.loc[lambda z: (x['EsHs'] > x['MARKET_VALUE_USD_EQVL']),'EsHs'] = x['MARKET_VALUE_USD_EQVL'] Can EsHs exceed the value of the exposure/collateral?
+    data_set['HS'] = data_set['Haircut Level'] * np.sqrt(data_set['Holding Period']/10)
+    data_set['HS_REVISED'] = data_set['Haircut Level']*np.sqrt(data_set['Holding Period']/10)        
+
+def aggregation(x):
+    wam = x.groupby(['NETTING_NODE_ID'])[['MAT_EXP','EXPOSURE']].sum()
+    wam['WAMAT'] = wam['MAT_EXP']/wam['EXPOSURE']
+    hfx = x.groupby(['NETTING_NODE_ID','RAY_HFX'])[['FX_MAT_POS']].sum()
+    hfx['ABS'] = hfx['FX_MAT_POS'].abs()
+    hfx.to_csv(output_path + "/test_hfx.txt", sep = "|", index=True)
+    #hfx ['ABS'][hfx['ABS'] < 0] = 0
+    hfx_tot = hfx.groupby(['NETTING_NODE_ID'])[['FX_MAT_POS','ABS']].sum()
+    #hfx_tot['ABS'] = hfx_tot['FX_MAT_POS'].abs()
+    hfx_tot.to_csv(output_path + "/test_hfx_tot.txt", sep = "|", index=True)
+
+    #Need to remove the NANs from CERES and B3 Derived to make the groupby work, otherwise it drops rows that don't have something in all fields
+    x.loc[lambda z: x['CERES_CURRENCY_CD'].astype(str) == 'nan','CERES_CURRENCY_CD'] = 'blank'
+    x.loc[lambda z: x['B3_DERIVED_COUNTRY'].astype(str) == 'nan','B3_DERIVED_COUNTRY'] = 'blank'
+                     
+    eshs = x.groupby(['NETTING_NODE_ID','SEC_ID','B3_FRB_STD_CLASS','CURRENCY','CERES_CURRENCY_CD','B3_DERIVED_COUNTRY'])[['EXPOSURE','COLLATERAL']].sum()
+    hs_rev_calc = x.groupby(['NETTING_NODE_ID','SEC_ID','B3_FRB_STD_CLASS','CURRENCY','CERES_CURRENCY_CD','B3_DERIVED_COUNTRY'])[['HS_REVISED']].max()
+    eshs['NET_E'] = eshs['EXPOSURE'] - eshs['COLLATERAL']
+    eshs['NET_E'] = eshs['NET_E'].abs()
+    maxes = eshs.groupby(['NETTING_NODE_ID'])['NET_E'].max()/10
+    maxes = maxes.rename('MAX_AMOUNT')
+    #maxes.index = maxes.index.astype(str)
+    eshs = eshs.merge(maxes.to_frame(),left_index = True, right_index = True)
+        
+    eshs = eshs.merge(hs_rev_calc,left_index = True,right_index = True)
+    eshs['N'] = 0 #Should this be zero or one?
+    eshs.to_csv(output_path + "/test_eshs2.txt", sep = "|", index=True)
+    eshs.loc[lambda z: (eshs['NET_E'] > eshs['MAX_AMOUNT']),'N'] = 1 # eshs['EXPOSURE'] - eshs['COLLATERAL'] if net amount
+    
+    eshs['ABS_EXP'] = eshs['EXPOSURE'] - eshs['COLLATERAL']
+    eshs['HS_SIGN'] = 0
+    eshs.loc[lambda z: (eshs['ABS_EXP'] < 0),'HS_SIGN'] = -1
+    eshs.loc[lambda z: (eshs['ABS_EXP'] > 0),'HS_SIGN'] = 1
+    eshs['ABS_EXP'] = eshs['ABS_EXP'].abs()
+    eshs['NET_EXP'] = eshs['ABS_EXP'] * eshs['HS_REVISED']*eshs['HS_SIGN']
+    eshs['GROSS_EXP'] = eshs['NET_EXP'].abs()
+        
+    ead_table = eshs.groupby(['NETTING_NODE_ID'])['EXPOSURE', 'COLLATERAL','N','NET_EXP','GROSS_EXP'].sum()
+    ead_table.loc[lambda z: (ead_table['N'] < 1), 'N'] = 1 
+    ead_table = ead_table.merge(hfx_tot,left_index = True,right_index = True)
+    ead_table['ABS_NET_EXP'] = ead_table['NET_EXP'].abs()
+    ead_table['ESHS'] = .4*ead_table['ABS_NET_EXP'] + .6*ead_table['GROSS_EXP']/np.sqrt(ead_table['N'])
+    ead_table['EAD'] = ead_table['EXPOSURE'] - ead_table['COLLATERAL'] + ead_table['ESHS'] + hfx_tot['ABS']
+    ead_table.loc[lambda z: (ead_table['EAD'] < 0),'EAD'] = 0
+    #ead_table['EAD'][ead_table['EAD'] < 0] = 0
+    ead_table['WAMAT'] = wam['WAMAT']
+    eshs.to_csv(output_path +"/test_eshs.txt", sep = "|", index=True) 
+    return(ead_table, x)
+    
+ead, data_set = aggregation(data_set)
+   
+ead.to_csv(output_path + "/test_ead.txt", sep = "|", index=True)   
+data_set.to_csv(output_path + "/test_data.txt", sep = "|", index=True)
+
+
+    
+
+
+
+
+
