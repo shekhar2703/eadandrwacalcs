@@ -1,0 +1,149 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Aug  8 23:15:17 2018
+
+@author: e620470
+"""
+
+import pandas as pd
+import numpy as np
+import math
+from math import log
+from scipy.stats import norm
+from scipy.special import ndtri
+import os
+
+current_date = input("Please enter date of calculation as month/day/year, e.g. 3/31/2018: ")
+#Setting up the variables to query the correct directories for the inputs, parameters, and outputs
+current_directory = (os.path.join(os.path.dirname(__file__)))
+parent_directory = os.path.split(current_directory)[0]
+input_path = os.path.join(parent_directory, 'Input Files',current_date.replace("/","_"),'RW - ADV')
+input_path = input_path.replace('\\','/')
+reference_path = os.path.join(parent_directory, 'Reference Tables','RW - ADV')
+reference_path = reference_path.replace('\\','/')
+output_path = os.path.join(parent_directory, 'Output Files',current_date.replace("/","_"),'RW - ADV')
+output_path = output_path.replace('\\','/')
+
+
+#Reading the input files
+df = pd.read_csv(input_path + "/DATA_ADV_OCT_2018.csv", delimiter ="|")
+df_avcm = pd.read_csv(input_path +"/AVCM.csv", delimiter ="|")
+df_un_ead = pd.read_csv(input_path +'/UNDRAWN_EAD.csv', delimiter = "|")
+df_avcm["COUNTERPARTY_ID"] = df_avcm["COUNTERPARTY_ID"].astype(str)
+df["COUNTERPARTY_NEW"] = df["COUNTERPARTY_NEW"].astype(str)
+df['CONTRACT_REFERENCE'] = df['CONTRACT_REFERENCE'].astype(str)
+df_un_ead['CONTRACT_REFERENCE_UN']= df_un_ead['CONTRACT_REFERENCE_UN'].astype(str)
+df_un_ead['EAD_B4'] = pd.to_numeric(df_un_ead['EAD_B4'])
+df_un_ead['CCF_B4'] = pd.to_numeric(df_un_ead['CCF_B4'])
+
+df=pd.merge(df, df_avcm[["COUNTERPARTY_ID","LFI_UFI"]],
+                      left_on="COUNTERPARTY_NEW", right_on="COUNTERPARTY_ID", how="left")
+
+df=pd.merge(df, df_un_ead[["CONTRACT_REFERENCE_UN", "CCF_B4", "EAD_B4"]],
+                      left_on="CONTRACT_REFERENCE", right_on="CONTRACT_REFERENCE_UN", how='left')
+
+#df.dtypes
+#df_avcm.dtypes
+
+#df.loc[lambda n: (df['PD_ORIGINAL']== 1), 'PD_ORIGINAL'] = 0.9999
+
+#Asset Value Correllation Multiplier (LFI/UFI)
+x = 1-np.exp(-50*df["PD_ORIGINAL"])
+y = 1-np.exp(-50)
+#z = 1-np.exp(-50*df["PD_ORIGINAL"])
+i = (0.12*(x/y)+0.24*(1-(x/y)))
+j = 1.25*i
+
+df['r_fac_calc'] = df['LFI_UFI']
+df.loc[lambda n: (df["r_fac_calc"].astype(str) == 'nan'), "r_fac"] = i
+df.loc[lambda n: (df["r_fac_calc"].astype(str) != 'nan'), "r_fac"] = j
+
+df['r_fac'] = pd.to_numeric(df['r_fac'])
+
+a0= np.log(df["PD_ORIGINAL"])
+a1= (0.11852-0.05478*a0)**2
+a2= np.sqrt(0.11852-0.05478*a0)
+df["b"] = a1
+print(df[["CONTRACT_REFERENCE","PD_ORIGINAL","b","r_fac"]])
+
+
+# k-Factor Calculation
+#k1 = (norm.cdf((norm.ppf(norm.cdf(df["PD_ORIGINAL"])))+np.sqrt(df["r"])*norm.ppf(norm.cdf(0.999))/np.sqrt(1-df["r"]))*df["LGD"]-(df["LGD"]*df["PD_ORIGINAL"]))*((1+(df["K_MATURITY"]-2.5)*df["b"])/(1-1.5*df["b"]))   
+
+k1 = np.sqrt(df["r_fac"])
+k2 = np.sqrt(1-df["r_fac"])
+k3 = ndtri(df["PD_ORIGINAL"])
+k4 = ndtri(0.999)
+a = df["LGD"]
+f = df["PD_ORIGINAL"]
+c = df["K_MATURITY"]
+d = df["b"] #col BF
+#x = df["r_fac"]
+k = (norm.cdf((k3+k1*k4)/k2)*a-(a*f))*((1+(c-2.5)*d)/(1-1.5*d))
+
+df["k"] = k
+df["RW"]=k*12.5
+df["RWA_CALC"]= df["RW"]*df["EAD"]*1.06
+
+df.loc[lambda n: (df['ASSET_CLASS_NEW'] == 'CLAIM_DEFAULT_FUND_QCCP') | (df['ASSET_CLASS_NEW'] == 'CLAIM_OTH_100'), 'RWA_CALC'] = df['RWA']
+df.loc[lambda n: (df['PD_ORIGINAL'].astype(str) == 'nan'), 'RWA_CALC'] = df['RWA']
+df.loc[lambda n: (df['ASSET_CLASS_NEW'] == 'CLAIM_TRADE_QCCP') | (df['ASSET_CLASS_NEW'] == 'CLAIM_SECURITIZATION'), 'RWA_CALC'] = df['RWA']
+df.loc[lambda n: (df['PD_ORIGINAL']== 1), 'RWA_CALC'] = df['RWA']
+
+#************* BASEL 4 PARAMETERS & CALCULATION *********************************
+
+df['PD_B4'] = df['PD_ORIGINAL']
+df['LGD_B4'] = df['LGD']
+df['MAT_B4'] = df['K_MATURITY']
+df.loc[lambda n: (df['PD_B4']< 0.0005), 'PD_B4'] = 0.0005
+df.loc[lambda n: (df['ASSET_CLASS_NEW'] == 'CLAIM_CORP')| (df['ASSET_CLASS_NEW'] == 'CLAIM_CORP_IPRE'), 'LGD_B4'] = 0.40
+df.loc[lambda n: (df['ASSET_CLASS_NEW'] == 'CLAIM_BANK'), 'LGD_B4'] = 0.45
+df.loc[lambda n: (df['ASSET_CLASS_NEW'] == 'CLAIM_CORP')| (df['ASSET_CLASS_NEW'] == 'CLAIM_CORP_IPRE'), 'MAT_B4'] = 2.5
+
+
+
+b4x = 1-np.exp(-50*df['PD_B4'])
+b4y = 1-np.exp(-50)
+b4i = (0.12*(b4x/b4y)+0.24*(1-(b4x/b4y)))
+b4j = 1.25*b4i
+
+df['r_fac_calc'] = df['LFI_UFI']
+df.loc[lambda n: (df["r_fac_calc"].astype(str) == 'nan'), "r_fac_b4"] = b4i
+df.loc[lambda n: (df["r_fac_calc"].astype(str) != 'nan'), "r_fac_b4"] = b4j
+
+df['r_fac_b4'] = pd.to_numeric(df['r_fac_b4'])
+
+a0_b4= np.log(df['PD_B4'])
+a1_b4= (0.11852-0.05478*a0_b4)**2
+a2_b4= np.sqrt(0.11852-0.05478*a0_b4)
+df["b_b4"] = a1_b4
+print(df[["CONTRACT_REFERENCE","PD_B4","b_b4","r_fac_b4"]])
+
+
+k1_b4 = np.sqrt(df["r_fac_b4"])
+k2_b4 = np.sqrt(1-df["r_fac_b4"])
+k3_b4 = ndtri(df["PD_B4"])
+k4_b4 = ndtri(0.999)
+a_b4 = df["LGD_B4"]
+f_b4 = df["PD_B4"]
+c_b4 = df["MAT_B4"]
+d_b4 = df["b_b4"]
+#x_b4 = df["r_fac_b4"]
+k_b4 = (norm.cdf((k3_b4+k1_b4*k4_b4)/k2_b4)*a_b4-(a_b4*f_b4))*((1+(c_b4-2.5)*d_b4)/(1-1.5*d_b4))
+
+df["k_b4"] = k_b4
+df["RW_B4"]=k_b4*12.5
+df["RWA_CALC_B4"]= df["RW_B4"]*df["EAD"]
+
+df.loc[lambda n: (df['ASSET_CLASS_NEW'] == 'CLAIM_DEFAULT_FUND_QCCP') | (df['ASSET_CLASS_NEW'] == 'CLAIM_OTH_100'), 'RWA_CALC_B4'] = df['RWA']
+#df.loc[lambda n: (df['PD_B4'].astype(str) == 'nan'), 'RWA_CALC_B4'] = df['RWA']
+df.loc[lambda n: (df['ASSET_CLASS_NEW'] == 'CLAIM_TRADE_QCCP') | (df['ASSET_CLASS_NEW'] == 'CLAIM_SECURITIZATION'), 'RWA_CALC_B4'] = df['RWA']
+df.loc[lambda n: (df['CONTRACT_TYPE'] == '8-4-F') | (df['CONTRACT_TYPE'] == '8-110-F') | (df['CONTRACT_TYPE'] == '8-2-F') | (df['CONTRACT_TYPE'] == '8-3-F') | (df['CONTRACT_TYPE'] == '8-1387-F') | (df['CONTRACT_TYPE'] == '8-1388-F') | (df['CONTRACT_TYPE'] == '8-9-F') | (df['CONTRACT_TYPE'] == '8-1268-F') | 
+        (df['CONTRACT_TYPE'] == '8-890-F') | (df['CONTRACT_TYPE'] == '8-111-F') | (df['CONTRACT_TYPE'] == '8-262-F') | (df['CONTRACT_TYPE'] == '8-261-F') | (df['CONTRACT_TYPE'] == '8-8'), 'RWA_CALC_B4' ] = (df['RW_B4']*df['EAD_B4'])
+df.loc[lambda n: (df['PD_B4'].astype(str) == 'nan'), 'RWA_CALC_B4'] = df['RWA']
+df.loc[lambda n: (df['PD_B4']== 1), 'RWA_CALC_B4'] = df['RWA']
+
+
+print(df[["CONTRACT_REFERENCE","RWA_CALC", "RWA_CALC_B4"]])
+
+df.to_csv(output_path + "/df_output.csv", sep="|")
