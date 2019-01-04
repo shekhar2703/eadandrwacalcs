@@ -1,0 +1,566 @@
+
+
+import pandas as pd
+import numpy as np
+import time
+import RiskWeight
+import inputTest
+import Guarantee
+import Sensitivity
+
+#Read inputs
+def readSQL(mode):
+    assert mode=="Agency" or mode=="EC","Only EC or Agency are valid modes. Check capital letters."
+    if mode=="Agency":
+        dealData = pd.read_excel("Inputs\Data\Agency_Positions0.xlsx")
+        erecData = pd.read_excel("Inputs\Data\Agency_EREC.xlsx")
+    else:
+        dealData = pd.read_excel("Inputs\Data\EC_Positions.xlsx")
+        erecData = pd.read_excel("Inputs\Data\EC_EREC.xlsx")
+    print(dealData.columns)
+    dealData["NETTING_NODE_ID"] = dealData["NETTING_NODE_ID"].astype(str)
+    return dealData,erecData
+
+def readRefTables():
+    RW_Table = pd.read_csv("Inputs/RW_Table.csv",index_col="ISO_CODE")
+    RW_Table = RW_Table[RW_Table["COUNTRY_ID"]!=-2]
+    RW_Table["NA"] = "NA"
+    
+    cTable = pd.read_csv("Inputs/Collateral_type_ID.csv",index_col="B3_FRB_STD_CLASS")
+    
+    haircutTable = pd.read_csv("Inputs/Haircut.csv")
+    haircutTable.fillna("NA",inplace=True)
+    haircutTable.index = haircutTable["Collateral Type ID"].astype(str)+"-"+haircutTable["Maturity Band ID"].astype(str)
+    
+    approachMap = pd.read_csv("Inputs/ApproachMap.csv",index_col="Position Type Code")
+    approachMap.index.name = "POS_TYPE"
+    approachMap.columns = ["Approach"]
+    
+    foreign = pd.read_csv("Inputs/ForeignTable.csv",index_col="Concatenation")
+    
+    rwb4 = pd.read_csv("Inputs/B4RW.csv").drop_duplicates()
+    rwb4.set_index("COUNTERPARTY_ID",inplace=True)
+    
+    consolidationRules = pd.read_csv("Inputs/ConsolidationRules.csv",index_col="LEGALENTITYID")
+    
+    OldMethodRW = pd.read_csv("Inputs/OldMethodRW.csv")
+    
+    classCP = pd.read_csv("Inputs/CP_Classification.csv",index_col="COUNTERPARTY_SUB_TYPE_DESC")
+    
+    currencies = pd.read_csv("Inputs/Currencies.csv",index_col="ISO Code")
+    
+    return RW_Table,cTable,haircutTable,approachMap,foreign,rwb4,consolidationRules,OldMethodRW,classCP,currencies
+
+def dealCalc(dealData,RW_Table,cTable,haircutTable,approachMap,mode,currencies,sensitivity):
+
+    dealData["RAY Hfx Currency Logic"] = dealData["CURRENCY"]
+    #Fill in any blank values with CERES_CURRENCY_CD
+    dealData.loc[(~dealData["CERES_CURRENCY_CD"].isnull()),"RAY Hfx Currency Logic"] = dealData["CERES_CURRENCY_CD"]
+    
+    def crcL(x):
+        if x[:3] == ("GSE"):
+            return "GSE"
+        elif x[:4] == ("Bank"):
+            return "Bank"
+        elif x[:3] == ("Sov"):
+            return "Sov"
+        else:
+            return "NA"
+    dealData["Type of CRC Lookup"] = dealData["B3_FRB_STD_CLASS"].apply(crcL)
+    
+    
+    temp = dealData["B3_DERIVED_COUNTRY"].copy()
+    temp.loc[temp.isnull()] = dealData["ISO_CNTRY_CD"]
+    dealData["CONCAT"] = dealData["SEC_ID"].astype(str).fillna("")+"_"+dealData["B3_FRB_STD_CLASS"].astype(str).fillna("")+"_"+dealData["CURRENCY"].astype(str).fillna("")+"_"+dealData["CERES_CURRENCY_CD"].astype(str).fillna("")+"_"+temp
+    
+    assert pd.isnull(dealData["NETTING_NODE_ID"]).sum()==0,"There are blank netting nodes."
+    dealData["Netting Concat"]=dealData["NETTING_NODE_ID"]+"+"+dealData["CONCAT"]
+    
+    if mode=="Agency":
+        dealData["Currency"] = dealData["ISO_CNTRY_CD"].apply(lambda x: currencies.loc[x,"Currency"])
+        dealData["Close-Out CCY(Agreement CCY)"] = dealData["AGREEMENT_CCY"]
+    
+    if mode=="EC":
+        def forex(x):
+            if x["POS_TYPE"]==9 or x["RAY Hfx Currency Logic"]=="USD":
+                return 0
+            elif x["POS_TYPE"] in [1,2,10]:
+                return x["MARKET_VALUE_USD_EQVL"]
+            elif x["POS_TYPE"] in [4,6,7,8]:
+                return -x["MARKET_VALUE_USD_EQVL"]
+            elif x["POS_TYPE"]==3:
+                return -x["CONTRACT_AMT_USD_EQVL"]
+            else:
+                return x["CONTRACT_AMT_USD_EQVL"]
+    else:
+        def forex(x):
+            if x["Currency"]=="USD" and x["Close-Out CCY(Agreement CCY)"]=="NULL":
+                return 0
+            elif x["Currency"] == x["Close-Out CCY(Agreement CCY)"]:
+                return 0
+            elif x["POS_TYPE"]==1 or x["POS_TYPE"]==2:
+                return x["MARKET_VALUE_USD_EQVL"]
+            elif x["POS_TYPE"]==4 or x["POS_TYPE"]==6:
+                return -x["MARKET_VALUE_USD_EQVL"]
+            elif x["POS_TYPE"]==3:
+                return -x["CONTRACT_AMT_USD_EQVL"]
+            else:
+                return x["CONTRACT_AMT_USD_EQVL"]
+    dealData["Forex Position"] = dealData.apply(forex,axis=1)
+    
+    if mode=="EC":
+        dealData["CRC Issuer RW"] = dealData.apply(lambda x: RW_Table.loc[x["ISO_CNTRY_CD"],x["Type of CRC Lookup"]],axis=1)
+    else:
+        def rw(x):
+            if x["B3_DERIVED_COUNTRY"]=="MULT":
+                return "NA"
+            if pd.isnull(x["B3_DERIVED_COUNTRY"]):
+                return RW_Table.loc[x["ISO_CNTRY_CD"],x["Type of CRC Lookup"]]
+            else:
+                return RW_Table.loc[x["B3_DERIVED_COUNTRY"],x["Type of CRC Lookup"]]
+        dealData["CRC Issuer RW"] = dealData.apply(rw,axis=1)
+        
+    def cType(x):
+        if x["Type of CRC Lookup"]=="NA":
+            return "NA"
+        elif x["Type of CRC Lookup"]=="Sov":
+            if x["CRC Issuer RW"]==0:
+                return 1
+            elif x["CRC Issuer RW"]==1:
+                return 3
+            elif x["CRC Issuer RW"]==1.5:
+                return 13
+            else:
+                return 2
+        else:
+            if x["CRC Issuer RW"]==.2:
+                return 4
+            elif x["CRC Issuer RW"]==.5:
+                return 5
+            elif x["CRC Issuer RW"]==1.5:
+                return 13
+            else:
+                return 6
+    dealData["CRC Collateral Type"] = dealData.apply(cType,axis=1)
+    
+    def cID(x):
+        if x["Type of CRC Lookup"]=="NA":
+            return cTable.loc[x["B3_FRB_STD_CLASS"],"Collateral Type ID"]
+        else:
+            return x["CRC Collateral Type"]
+    dealData["Collateral Type ID"] = dealData.apply(cID,axis=1)
+    
+    if mode=="Agency":
+        def fixT(x):
+            if x=="Banks 1 To 5":
+                return "Banks 1 to 5"
+            else:
+                return x
+        dealData["B3_FRB_STD_CLASS"] = dealData["B3_FRB_STD_CLASS"].apply(fixT)
+    
+    dealData["Maturity Band ID"] = dealData["B3_FRB_STD_CLASS"].apply(lambda x: cTable.loc[x,"Maturity Band ID"])
+    dealData["Maturity Band ID"].fillna("NA",inplace=True)
+    
+    i = dealData["Collateral Type ID"].astype(str)+"-"+dealData["Maturity Band ID"].astype(str)
+    #Get the concat that we want to match to a haircut rate
+    dealData["Haircut"] = i.apply(lambda x: haircutTable.loc[x,"Supervisory Haircut"])
+    #Get the haircut rate
+    
+    i2 = i.apply(lambda x: haircutTable.loc[x,"Holding Period"])
+    #Get the holding period related to the combinations
+    def holdingPeriod(x):
+        if x["B3_FRB_STD_CLASS"]=="Ineligible Collateral":
+            return 10
+        elif x["NETTING_NODE_ID"][-2:]=="LL" or x["B3_ASSET_SUBCLASS"][:4]=="Conv" or x["B3_ASSET_SUBCLASS"][:3]=="Sec":
+            return 20
+        else:
+            return i2.loc[x.name]
+    dealData["Holding Period"] = dealData.apply(holdingPeriod,axis=1)
+    
+    
+    #****
+    if sensitivity["HoldingPeriodMod"]:
+        Sensitivity.holdingPeriodMod(dealData)
+    
+    dealData["Hs"] = dealData["Haircut"]*(dealData["Holding Period"]/10)**.5
+    
+    if mode=="EC": 
+        def EsHs(x):
+            if x["POS_TYPE"]==3 or x["POS_TYPE"]==9:
+                return 0
+            else:
+                return x["MARKET_VALUE_USD_EQVL"]*x["Hs"]
+        dealData["Es*Hs"] = dealData.apply(EsHs,axis=1)
+    else:
+        dealData["Es*Hs"] = dealData["MARKET_VALUE_USD_EQVL"]*dealData["Hs"]
+    
+    
+    
+    dealData["Approach"] = dealData["POS_TYPE"].apply(lambda x: approachMap.loc[x,"Approach"])
+    dealData["Days to Maturity"] = (dealData["TERM_DATE"]-dealData["AS_OF_DATE"])/pd.Timedelta('1 days')
+    
+    if mode=="EC":
+        def E(y):
+            x = y["Approach"]
+            if x=="A" or x=="C":
+                return y["MARKET_VALUE_USD_EQVL"]
+            elif x=="B" or x=="E":
+                return y["CONTRACT_AMT_USD_EQVL"]
+            else:
+                return 0
+    else:
+        def E(y):
+            x = y["POS_TYPE"]
+            if x==1 or x==2:
+                return y["MARKET_VALUE_USD_EQVL"]
+            elif x==4 or x==3 or x==6:
+                return 0
+            else:
+                return y["CONTRACT_AMT_USD_EQVL"]
+    dealData["E"] = dealData.apply(E,axis=1)
+    
+    
+    if mode=="EC":
+        def C(y):
+            x = y["Approach"]
+            if x=="B" or x=="D":
+                return y["MARKET_VALUE_USD_EQVL"]
+            elif x=="A" or x=="F":
+                return y["CONTRACT_AMT_USD_EQVL"]
+            else:
+                return 0
+    else:
+        def C(y):
+            x = y["POS_TYPE"]
+            if x==4 or x==6:
+                return y["MARKET_VALUE_USD_EQVL"]
+            elif x==1 or x==2 or x==5:
+                return 0
+            else:
+                return y["CONTRACT_AMT_USD_EQVL"]
+    dealData["C"] = dealData.apply(C,axis=1)
+    
+
+    if mode=="EC":
+        def hsSign(x):
+            if x in [1,2,10]:
+                return 1
+            elif x in [4,7,8]:
+                return -1
+            else:
+                return 0
+    else:
+        def hsSign(x):
+            if x in [1,2]:
+                return 1
+            elif x in [4,6]:
+                return -1
+            else:
+                return 0
+    dealData["Hs-Sign"] = dealData["POS_TYPE"].apply(hsSign)
+    
+    if mode=="EC":
+        dealData["Nr"] = 1
+        dealData["Hs-Revised"] = dealData["Hs-Sign"]*dealData["Haircut"] *((dealData["Nr"]+dealData["Holding Period"]-1)/10)**.5
+    else:
+        dealData["Hs-Revised"] = dealData["Hs-Sign"]*dealData["Haircut"] *((dealData["Holding Period"])/10)**.5
+
+def fxCalc(dealData):
+    #*** EXPLAIN THIS
+    fx = dealData.groupby(["NETTING_NODE_ID","RAY Hfx Currency Logic"]).sum()["Forex Position"]
+    fx = pd.DataFrame(fx).reset_index()
+    fx = fx.pivot("NETTING_NODE_ID", "RAY Hfx Currency Logic","Forex Position").fillna(0)
+    
+    #Add Fx Exposure to each column name 
+    fx.columns = fx.columns + " FX Exposure"
+    
+    fx["FX Haircut Base"] = abs(fx).sum(axis=1)
+    
+    
+    #*** possibly change this
+    def holdingPeriod(x):
+        if x.name[-2:]=="LL":
+            return 20
+        else:
+            return 5
+    fx["Holding Period"] = fx.apply(holdingPeriod,axis=1)
+    fx["Hfx"] = (fx["Holding Period"]/10)**.5*.08
+    fx["FX Haircut"] = fx["Hfx"]*fx["FX Haircut Base"]
+    
+    
+    def WAM():
+        temp = pd.concat([dealData[["E","C"]].max(axis=1),dealData[["Days to Maturity","NETTING_NODE_ID"]]],axis=1)
+        temp.columns = ["W","Days","Node"]
+        totalW = temp.groupby("Node")["W"].sum()
+        temp["W"] = temp["W"]/totalW.loc[temp["Node"]].reset_index(drop=True)
+        temp["WAM"] = temp["W"]*temp["Days"]
+        return temp.groupby("Node").sum()["WAM"]
+    fx["WAM"] = WAM()
+    return fx
+
+
+def EsHsCalc(dealData,nettingData,mode):
+    #Doesn't this definition effectively neutralize the effect of the 0 in Hs-Sign?
+    #*** follow up praveen
+    if mode=="EC":
+        d1 = dealData.groupby("Netting Concat").sum()[["E","C"]]
+        d2 = dealData.groupby("Netting Concat").mean()["Hs"]
+        d3 = dealData.groupby("Netting Concat").first()["Hs-Revised"]
+        concatData = pd.concat([d1,d2,d3],axis=1)
+    else:
+        d1 = dealData.groupby("Netting Concat").sum()[["E","C"]]
+        d2 = dealData.groupby("Netting Concat").mean()["Hs"]
+        concatData = pd.concat([d1,d2],axis=1)
+        concatData["E-C"] = concatData["E"]-concatData["C"]
+        def hsRev(x):
+            if x["E-C"]<0:
+                return -x["Hs"]
+            else:
+                return x["Hs"]
+        concatData["Hs-Revised"] = concatData.apply(hsRev,axis=1)
+    
+    concatData["Abs(E-C)"] = abs(concatData["E"]-concatData["C"])
+    concatData["Net Exposure"] = concatData["Hs-Revised"]*concatData["Abs(E-C)"]
+    concatData["Gross Exposure"] = abs(concatData["Net Exposure"])
+    #*** look below
+    #*** certain conditions if 1/10 of highest value for N
+    concatData["NETTING_NODE_ID"] = dealData[["NETTING_NODE_ID","Netting Concat"]].groupby("Netting Concat").first()["NETTING_NODE_ID"]
+    
+    nettingData["Count"] = concatData.groupby(["NETTING_NODE_ID"]).size()
+
+    return concatData
+
+def EADCalc(nettingData,concatData):
+    nettingData[["E","C","Net Exposure","Gross Exposure"]] =  concatData.groupby("NETTING_NODE_ID").sum()[["E","C","Net Exposure","Gross Exposure"]]
+    nettingData["ABS(Net-Exposure)"]=abs(nettingData["Net Exposure"])
+    nettingData["EsHs-B4"] = .4*nettingData["ABS(Net-Exposure)"]+.6*nettingData["Gross Exposure"]/(nettingData["Count"]**.5)
+    nettingData["EAD-BASEL-4"] = nettingData["E"]-nettingData["C"]+nettingData["EsHs-B4"]+nettingData["FX Haircut"]
+    nettingData["EAD-BASEL-4"] = nettingData["EAD-BASEL-4"].apply(lambda x: max(x,0))
+    
+    
+    
+def RWACalc(dealData,nettingData,erecData,RW_Table,foreign,OldMethodRW,consolidationRules):
+    cols = ["SOURCE_ACCOUNT_NUM","NETTING_NODE_ID","COUNTERPARTY_ID","INTERCOMPANY_FLG","EREC_ID","IFS_COMPANY"]
+    temp = dealData[cols].copy()
+    #Drop duplicate rows, each 
+    temp.drop_duplicates(keep="first",inplace=True)
+    #Each netting set should have only one set of associated data
+    #*** This is not the case
+    if max(temp["NETTING_NODE_ID"].value_counts())>1:
+        print("WARNING: Matching NETTING_NODE_IDs have different values in this data")
+        temp = temp.groupby("NETTING_NODE_ID").first()
+    else:
+        temp.set_index("NETTING_NODE_ID",inplace=True)
+    nettingData[["SOURCE_ACCOUNT_NUM","COUNTERPARTY_ID","INTERCOMPANY_FLG","EREC_ID","STD_IFS_COMPANY"]] = temp
+    
+    cols = ["COUNTERPARTY_ID","COUNTERPARTY_TYPE_ID","COUNTERPARTY_SUB_TYPE_ID","DOMICILE_ID","COUNTERPARTY_NAME"]
+    temp = erecData[cols].copy()
+    temp.drop_duplicates(keep="first",inplace=True)
+    names = ["UCI","CP Type","CP Sub Type","Domicile","Counterparty Name"]
+    temp.index = temp["COUNTERPARTY_ID"]
+    nettingData[names] = nettingData["COUNTERPARTY_ID"].apply(lambda x: temp.loc[x,["COUNTERPARTY_ID","COUNTERPARTY_TYPE_ID","COUNTERPARTY_SUB_TYPE_ID","DOMICILE_ID","COUNTERPARTY_NAME"]])
+    
+    nettingData.loc[nettingData["EREC_ID"].isnull(),"UCI"] = nettingData["COUNTERPARTY_ID"]
+    
+    #***There are missing subtypes from some erec infor
+    #***We fill 0 to be consistent with excel but this is an issue to be discussed
+    nettingData["CP Sub Type"].fillna(0,inplace=True)
+    nettingData["CP Type"].fillna(0,inplace=True)
+    nettingData["Domicile"].fillna(0,inplace=True)
+    
+    nettingData["Concatenation"] = nettingData["CP Type"].astype(int).astype(str)+"-"+nettingData["CP Sub Type"].astype(int).astype(str)
+    nettingData["Foreign Type"] = nettingData["Concatenation"].apply(lambda x: foreign.loc[x,"Foreign"])
+    
+    
+
+    
+    temp = RW_Table.set_index("COUNTRY_ID")
+    def rwb3(x):
+        if pd.isnull(x["UCI"]):
+            return 1
+        elif x["Domicile"]==238:
+            return foreign.loc[x["Concatenation"],"BIII Std App RW"]
+        elif x["Foreign Type"]==1:
+            return temp.loc[x["Domicile"],"Bank"]
+        elif x["Foreign Type"]==2:
+            return temp.loc[x["Domicile"],"Sov"]
+        elif x["Foreign Type"]==3:
+            return temp.loc[x["Domicile"],"PSE"]
+        else:
+            return foreign.loc[x["Concatenation"],"BIII Std App RW"]
+    nettingData["RW-B3"] = nettingData.apply(rwb3,axis=1)
+    
+    
+    #***
+
+    
+    #***Check duplicates
+    def doubleMatch(x,key):
+        i = erecData[(x["SOURCE_ACCOUNT_NUM"]==erecData["SOURCE_ACCOUNT_NUM"]) & (x["COUNTERPARTY_ID"]==erecData["COUNTERPARTY_ID"])]
+        i = i.iloc[0]
+        return i[key]
+    nettingData["IFS_COMPANY"] = nettingData.apply(lambda x: doubleMatch(x,"IFS_COMPANY"),axis=1)
+    nettingData["COUNTERPARTY_IFS_COMPANY"] = nettingData.apply(lambda x: doubleMatch(x,"COUNTERPARTY_IFS_COMPANY"),axis=1)
+    nettingData["INTERNAL_COMPANY_FLAG"] = nettingData.apply(lambda x: doubleMatch(x,"INTERNAL_COMPANY_FLAG"),axis=1)
+    nettingData["Legal Entity"] = nettingData["IFS_COMPANY"]
+    
+    #***
+    nettingData["COUNTERPARTY_IFS_COMPANY"].fillna(0,inplace=True)
+    
+    def internal(x):
+        if x["COUNTERPARTY_IFS_COMPANY"]!=0:
+            return x["COUNTERPARTY_IFS_COMPANY"]
+        elif x["INTERNAL_COMPANY_FLAG"]=="Y":
+            return 2001
+        else:
+            return 0
+    nettingData["Internal Legal Entity"] = nettingData.apply(internal,axis=1)
+    
+    nettingData["Bank Consolidate"] = nettingData["Legal Entity"].apply(lambda x: consolidationRules.loc[x,"BANK"])
+    
+    def BE(x):
+        if x==0:
+            return 1
+        else:
+            return consolidationRules.loc[x,"BANK Internal"]
+    nettingData["Bank Eliminate"] = nettingData["Internal Legal Entity"].apply(BE)
+    
+    nettingData.loc[nettingData["Internal Legal Entity"]==0,"Include in Corp"] = 1
+    nettingData.loc[nettingData["IFS_COMPANY"].isnull(),"Include in Corp"] = 0
+    nettingData["Include in Corp"].fillna(0,inplace=True)
+    
+    def IC(x):
+        if (x["Bank Consolidate"]==1) and (x["Bank Eliminate"]==1):
+            return 1
+        else:
+            return 0
+    nettingData["Include in Bank"] = nettingData.apply(IC,axis=1)
+    nettingData.loc[nettingData["IFS_COMPANY"].isnull(),"Include in Bank"] = 0
+    nettingData["SSIH Consolidate"] = nettingData["Legal Entity"].apply(lambda x: consolidationRules.loc[x,"SSIH"])
+    
+    def BE(x):
+        if x==0:
+            return 1
+        else:
+            return consolidationRules.loc[x,"SSIH Internal"]
+    nettingData["SSIH Eliminate"] = nettingData["Internal Legal Entity"].apply(BE)
+    
+    def IC(x):
+        if (x["SSIH Consolidate"]==1) and (x["SSIH Eliminate"]==1):
+            return 1
+        else:
+            return 0
+        
+
+    nettingData["SSIH"] = nettingData.apply(IC,axis=1)
+    nettingData.loc[nettingData["IFS_COMPANY"].isnull(),"SSIH"] = 0
+    
+    nettingData["STD_Bank Consolidate"] = nettingData["STD_IFS_COMPANY"].apply(lambda x: consolidationRules.loc[x,"BANK"])
+    nettingData["STD_Bank Eliminate"] = nettingData["Bank Eliminate"]
+
+    cols = ["COUNTERPARTY_ID","GUARANTOR_ID","GUARANTOR_TYPE_ID","GUARANTOR_SUB_TYPE_ID","GUARANTOR_DOMICILE_ID","COUNTERPARTY_TYPE_DESC","COUNTERPARTY_SUB_TYPE_DESC","RATING"]
+    temp = erecData[cols].copy()
+    temp.drop_duplicates(keep="first",inplace=True)
+    temp.set_index("COUNTERPARTY_ID",inplace=True)
+    #***
+    nettingData[["GUARANTOR_ID","GUARANTOR_TYPE_ID","GUARANTOR_SUB_TYPE_ID","GUARANTOR_DOMICILE_ID","COUNTERPARTY_TYPE_DESC","COUNTERPARTY_SUB_TYPE_DESC","RATING"]] = nettingData["UCI"].apply(lambda x: temp.loc[x])
+    #***
+    nettingData["ASSET_CLASS_NEW"] = "None"
+    nettingData["Product"] = "None"
+    RiskWeight.Calc(nettingData)
+    
+    nettingData["RWA-B4"] = nettingData["EAD-BASEL-4"]*nettingData["RW-B4"]
+    nettingData["RWA-B3"] = nettingData["EAD-BASEL-4"]*nettingData["RW-B3"]
+    
+
+
+
+
+
+
+def execute(mode,sensitivity,asOfDate,chunking=1,agg=True):
+    start = time.time()
+    #add a parameter dictionary
+    dealData,erecData = readSQL(mode)
+    RW_Table,cTable,haircutTable,approachMap,foreign,rwb4,consolidationRules,OldMethodRW,classCP,currencies = readRefTables()
+    
+    #Add in any modifications to these for sensitivity parameters
+    if chunking==1:
+        dealCalc(dealData,RW_Table,cTable,haircutTable,approachMap,mode,currencies,sensitivity)
+        print("dealCalc ran successfully")
+        nettingData = fxCalc(dealData)
+        print("fxCalc ran successfully")
+        concatData = EsHsCalc(dealData,nettingData,mode)
+        print("EsHsCalc ran successfully")
+        EADCalc(nettingData,concatData)
+        print("EADCalc ran successfully")
+        RWACalc(dealData,nettingData,erecData,RW_Table,foreign,OldMethodRW,consolidationRules)
+        print("RWACalc ran successfully")
+        
+        
+        #nettingData[["B3 Guarantee Benefit","B4 Guarantee Benefit"]] = Guarantee.calc(nettingData,RW_Table,foreign,erecData,"9/29/2017")
+        #nettingData["RWA-B4 Adj"] = nettingData["RWA-B4"] - nettingData["B4 Guarantee Benefit"]
+        #nettingData["RWA-B3 Adj"] = nettingData["RWA-B3"] - nettingData["B3 Guarantee Benefit"]
+        
+        dealData.to_csv("Output/dealData_"+mode+".csv", encoding='utf-8')
+        nettingData.to_csv("Output/nettingData_"+mode+".csv", encoding='utf-8')
+        concatData.to_csv("Output/concatData_"+mode+".csv", encoding='utf-8')
+        return dealData,concatData,nettingData
+    else:
+        dealDataLarge,erecData = readSQL(mode)
+        IDs = dealDataLarge["NETTING_NODE_ID"].unique()
+        np.random.shuffle(IDs)
+        #Shuffle to avoid uneven splits (unique function returns higher density value at top)
+        cuts = np.linspace(0,len(IDs),chunking+1).astype(int)
+        dealDataLarge.set_index("NETTING_NODE_ID",inplace=True)
+        iteration = 1
+        for i,j in zip(cuts[:-1],cuts[1:]):
+            nodes = IDs[i:j]
+            dealData = dealDataLarge.loc[nodes].copy().reset_index()
+            dealCalc(dealData,RW_Table,cTable,haircutTable,approachMap,mode,currencies,sensitivity)
+            nettingData = fxCalc(dealData)
+            concatData = EsHsCalc(dealData,nettingData,mode)
+            EADCalc(nettingData,concatData)
+            RWACalc(dealData,nettingData,erecData,RW_Table,foreign,OldMethodRW,consolidationRules)
+            dealData.to_csv("Middle Calculations/dealData "+str(iteration)+".csv", encoding='utf-8')
+            nettingData.to_csv("Middle Calculations/nettingData "+str(iteration)+".csv", encoding='utf-8')
+            concatData.to_csv("Middle Calculations/concatData "+str(iteration)+".csv", encoding='utf-8')
+            print("Iteration "+str(iteration)+"/"+str(chunking)+" complete.")
+            iteration+=1
+        if agg==True:
+            d1 = []
+            d2 = []
+            d3 = []
+            for i in range(1,iteration):
+                d1.append(pd.read_csv("Middle Calculations/dealData "+str(i)+".csv", encoding='utf-8'))
+                d2.append(pd.read_csv("Middle Calculations/nettingData "+str(i)+".csv", encoding='utf-8',index_col="NETTING_NODE_ID"))
+                d3.append(pd.read_csv("Middle Calculations/concatData "+str(i)+".csv", encoding='utf-8'))
+            dealData = pd.concat(d1)
+            dealData.to_csv("Output/dealData_"+mode+".csv", encoding='utf-8')
+            nettingData = pd.concat(d2)
+            
+            nettingData[["B3 Guarantee Benefit","B4 Guarantee Benefit"]] = Guarantee.calc(nettingData,RW_Table,foreign,erecData,"9/29/2017")
+            nettingData["RWA-B4 Adj"] = nettingData["RWA-B4"] - nettingData["B4 Guarantee Benefit"]
+            nettingData["RWA-B3 Adj"] = nettingData["RWA-B3"] - nettingData["B3 Guarantee Benefit"]
+            
+            nettingData.to_csv("Output/nettingData_"+mode+".csv", encoding='utf-8')
+            concatData = pd.concat(d3)
+            concatData.to_csv("Output/concatData_"+mode+".csv", encoding='utf-8')
+    print("Total Time (minutes): "+str((time.time()-start)/60))
+
+
+sensitivityTesting = [{"HoldingPeriodMod":False},{"HoldingPeriodMod":True}]
+
+
+dealData,concatData,nettingData = execute("Agency",sensitivityTesting[0],"12/31/2017",chunking=100)
+#***Chunking is not done in a calculation which has chunking but no aggregation
+
+def sensitivityTest(mode,sensitivitySet,asOfDate,chunking=1,agg=True):
+    totalStats = []
+    for x in range(len(sensitivitySet)):
+        dealData,concatData,nettingData = execute("EC",sensitivitySet[x],"9/29/2017",chunking=1)
+        stats = nettingData[["RWA-B4","RWA-B3","EAD-BASEL-4"]].sum()
+        totalStats.append(stats)
+    return totalStats
+
+#totalStats = sensitivityTest("EC",sensitivityTesting,"9/29/2017",chunking=1)
